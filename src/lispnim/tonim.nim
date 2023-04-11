@@ -48,7 +48,11 @@ proc toNim*(lisp: Lisp): UntypedNode =
     of "nil":
       result = node(nnkNilLit, topInfo)
     else:
-      result = node(nnkIdent, topInfo, a)
+      if a[0] in IdentStartChars and '-' in a:
+        # kebab case insensitive
+        result = node(nnkIdent, topInfo, a.replace('-', '_'))
+      else:
+        result = node(nnkIdent, topInfo, a)
   of List:
     proc map(a: openarray[Lisp]): seq[UntypedNode] =
       result = newSeq[UntypedNode](a.len)
@@ -56,8 +60,61 @@ proc toNim*(lisp: Lisp): UntypedNode =
         result[i] = toNim(a[i])
     let cn = lisp.children
     if cn.len == 0:
-      result = node(nnkTupleConstr, topInfo)
+      result = node(nnkEmpty, topInfo)
     elif cn[0].kind == Atom:
+      proc ident(a: Lisp, inFor: static bool = false): UntypedNode =
+        proc asVarTuple(x: Lisp, inFor: static bool = false): UntypedNode =
+          if x.kind == List:
+            var nodes = newSeq[UntypedNode](x.children.len + 2 - ord(inFor))
+            for i in 0 ..< x.children.len:
+              nodes[i] = asVarTuple(x.children[i])
+            nodes[x.children.len] = node(nnkEmpty, x.info)
+            when not inFor:
+              nodes[x.children.len + 1] = node(nnkEmpty, x.info)
+            result = node(nnkVarTuple, x.info, nodes)
+          else:
+            result = toNim(x)
+        if a.kind == List and a.children.len != 0:
+          result = asVarTuple(a.children[0], inFor)
+          for i in 1 ..< a.children.len:
+            let x = a.children[i]
+            if x.kind == Atom and x.atom == "*":
+              result = node(nnkPostfix, a.info, node(nnkIdent, x.info, "*"), result)
+            if x.kind == List and x.children.len != 0 and
+              x.children[0].kind == Atom and x.children[0].atom == "pragma":
+              result = node(nnkPragmaExpr, a.info, result, node(nnkPragma, x.info, map(x.children.toOpenArray(1, x.children.len - 1))))
+        else: result = toNim(a)
+      proc typeBiasedIdentDef(n: Lisp): UntypedNode =
+        if n.kind == List:
+          let len = n.children.len
+          let hasDefault = n.children[len - 1].kind == List and
+            n.children[len - 1].children.len == 2 and
+            n.children[len - 1].children[0].kind == Atom and
+            n.children[len - 1].children[0].atom == "="
+          if hasDefault:
+            var defNodes = newSeq[UntypedNode](len)
+            for i in 0 ..< len - 2:
+              defNodes[i] = ident(n.children[i])
+            let typeNode = n.children[len - 2]
+            if typeNode.kind == List and typeNode.children.len == 0:
+              defNodes[len - 2] = node(nnkEmpty, typeNode.info)
+            else:
+              defNodes[len - 2] = toNim(typeNode)
+            defNodes[len - 1] = toNim(n.children[len - 1].children[1])
+            result = node(nnkIdentDefs, n.info, defNodes)
+          else:
+            var defNodes = newSeq[UntypedNode](len + 1)
+            for i in 0 ..< len - 1:
+              defNodes[i] = ident(n.children[i])
+            let typeNode = n.children[len - 1]
+            if typeNode.kind == List and typeNode.children.len == 0:
+              defNodes[len - 1] = node(nnkEmpty, typeNode.info)
+            else:
+              defNodes[len - 1] = toNim(typeNode)
+            defNodes[len] = node(nnkEmpty, n.info)
+            result = node(nnkIdentDefs, n.info, defNodes)
+        else:
+          result = node(nnkIdentDefs, n.info, ident(n), node(nnkEmpty, n.info), node(nnkEmpty, n.info))
       let a = cn[0].atom
       template args: untyped = cn.toOpenArray(1, cn.len - 1)
       case a
@@ -160,7 +217,7 @@ proc toNim*(lisp: Lisp): UntypedNode =
       of "var-type":
         if cn.len < 3:
           result = node(nnkVarTy, topInfo, map(args))
-      of "tuple":
+      of "tuple", "tuple-type":
         if cn.len == 1:
           result = node(nnkTupleClassTy, topInfo)
         elif cn.len == 2 and cn[1].kind == List and cn[1].children.len == 0:
@@ -183,6 +240,197 @@ proc toNim*(lisp: Lisp): UntypedNode =
           result = node(nnkExprColonExpr, topInfo, map(args))
       of ".":
         result = node(nnkDotExpr, topInfo, map(args))
+      of "=":
+        if cn.len == 2:
+          result = node(nnkAsgn, topInfo, map(args))
+      of "var", "let", "const":
+        var kind, defKind: UntypedNodeKind
+        case a
+        of "var": kind = nnkVarSection; defKind = nnkIdentDefs
+        of "let": kind = nnkLetSection; defKind = nnkIdentDefs
+        of "const": kind = nnkConstSection; defKind = nnkConstDef
+        block sectioner:
+          if kind == nnkVarSection and cn.len == 2 and cn[0].kind != List:
+            result = node(nnkVarTy, topInfo, toNim(cn[0]))
+            break sectioner
+          var nodes = newSeq[UntypedNode](cn.len - 1)
+          for i in 1 ..< cn.len:
+            let n = cn[i]
+            if n.kind == List and n.children.len > 1:
+              if n.children.len == 2:
+                nodes[i - 1] = node(defKind, n.info, ident(n.children[0]), node(nnkEmpty, n.info), toNim(n.children[1]))
+              else:
+                var defNodes = newSeq[UntypedNode](n.children.len)
+                for i in 0 ..< n.children.len - 2:
+                  defNodes[i] = ident(n.children[i])
+                defNodes[^2] = toNim(n.children[^2])
+                defNodes[^1] = toNim(n.children[^1])
+                nodes[i - 1] = node(defKind, n.info, defNodes)
+            else:
+              break sectioner
+          result = node(kind, topInfo, nodes)
+      of "enum":
+        if cn.len == 1:
+          result = node(nnkEnumTy, topInfo)
+        else:
+          var nodes = newSeq[UntypedNode](lisp.children.len)
+          nodes[0] = node(nnkEmpty, lisp.info)
+          for i in 1 ..< lisp.children.len:
+            let c = lisp.children[i]
+            if c.kind == List and c.children.len == 3 and
+              c.children[0].kind == Atom and c.children[0].atom == "=":
+              nodes[i] = node(nnkEnumFieldDef, c.info, ident(c.children[1]), toNim(c.children[2]))
+            else:
+              nodes[i] = ident(c)
+          result = node(nnkEnumTy, lisp.info, nodes)
+      of "object":
+        if cn.len == 1:
+          result = node(nnkObjectTy, topInfo)
+        else:
+          var nodes = newSeq[UntypedNode](3)
+          nodes[0] = node(nnkEmpty, topInfo)
+          var start = 1
+          if cn[start].kind == List and cn[start].children.len == 2 and
+            cn[start].children[0].kind == Atom and
+            cn[start].children[0].atom == "of":
+            nodes[1] = node(nnkOfInherit, cn[start].info,
+              toNim(cn[start].children[1]))
+            inc start
+          else:
+            nodes[1] = node(nnkEmpty, topInfo)
+          proc parseRecList(x: Lisp): UntypedNode
+          proc parseRec(x: Lisp): UntypedNode =
+            if x.kind == List and x.children.len != 0 and x.children[0].kind == Atom:
+              let a = x.children[0].atom
+              if a == "case":
+                var nodes = newSeq[UntypedNode](x.children.len - 1)
+                for i in 1 ..< x.children.len - 2:
+                  let y = x.children[i]
+                  if y.kind == List and y.children.len != 0 and y.children[0].kind == Atom:
+                    let b = y.children[0].atom
+                    if b == "of":
+                      var nodes2 = newSeq[UntypedNode](y.children.len - 1)
+                      for i in 1 ..< y.children.len - 2:
+                        nodes2[i - 1] = toNim(y.children[i])
+                      nodes2[y.children.len - 2] = parseRecList(y.children[y.children.len - 1])
+                      nodes[i - 1] = node(nnkOfBranch, y.info, nodes2)
+                    elif b == "else" and y.children.len == 2:
+                      nodes[i - 1] = node(nnkElse, y.info, parseRecList(y.children[2]))
+                    elif b == "elif" and y.children.len == 3:
+                      nodes[i - 1] = node(nnkElifBranch, y.info, toNim(y.children[1]), parseRecList(y.children[2]))
+                    else:
+                      nodes[i - 1] = toNim(y)
+                  else:
+                    nodes[i - 1] = toNim(y)
+                nodes[^1] = parseRecList(x.children[^1])
+                result = node(nnkRecCase, x.info, map(x.children.toOpenArray(1, x.children.len - 1)))
+              elif a == "when":
+                var nodes = newSeq[UntypedNode](x.children.len - 1)
+                for i in 1 ..< x.children.len - 2:
+                  let y = x.children[i]
+                  if y.kind == List and y.children.len != 0 and y.children[0].kind == Atom:
+                    let b = y.children[0].atom
+                    if b == "else" and y.children.len == 2:
+                      nodes[i - 1] = node(nnkElse, y.info, parseRecList(y.children[2]))
+                    elif b == "elif" and y.children.len == 3:
+                      nodes[i - 1] = node(nnkElifBranch, y.info, toNim(y.children[1]), parseRecList(y.children[2]))
+                    else:
+                      nodes[i - 1] = toNim(y)
+                  else:
+                    nodes[i - 1] = toNim(y)
+                nodes[^1] = parseRecList(x.children[^1])
+                result = node(nnkRecCase, x.info, map(x.children.toOpenArray(1, x.children.len - 1)))
+              else:
+                result = typeBiasedIdentDef(x)
+            else:
+              result = typeBiasedIdentDef(x)
+          proc parseRecList(x: Lisp): UntypedNode =
+            if x.kind == List:
+              var nodes = newSeq[UntypedNode](x.children.len)
+              for i in 0 ..< x.children.len:
+                nodes[i] = parseRec(x.children[i])
+              result = node(nnkRecList, x.info, nodes)
+            else:
+              result = node(nnkRecList, x.info, parseRec(x))
+          nodes[2] = parseRecList(cn[start])
+      of "type":
+        block sectioner:
+          var nodes = newSeq[UntypedNode](cn.len - 1)
+          for i in 1 ..< cn.len:
+            let n = cn[i]
+            if n.kind == List and n.children.len > 1:
+              if n.children.len == 2:
+                nodes[i - 1] = node(nnkTypeDef, n.info, ident(n.children[0]), node(nnkEmpty, n.info), toNim(n.children[1]))
+              elif n.children.len == 3:
+                let name = ident(n.children[0])
+                var genericParamNodes: seq[UntypedNode]
+                let generic = n.children[1]
+                if generic.kind == List:
+                  genericParamNodes = newSeq[UntypedNode](generic.children.len)
+                  for i in 0 ..< generic.children.len:
+                    genericParamNodes[i] = typeBiasedIdentDef(generic.children[i])
+                else: break sectioner
+                nodes[i - 1] = node(nnkTypeDef, n.info,
+                  name,
+                  node(nnkGenericParams, generic.info, genericParamNodes),
+                  toNim(n.children[2]))
+              else:
+                break sectioner
+            else:
+              break sectioner
+          result = node(nnkTypeSection, topInfo, nodes)
+      of "pragma-block":
+        if cn.len > 1:
+          var pragmaNodes = newSeq[UntypedNode](cn.len - 2)
+          for i in 1 ..< cn.len - 1:
+            pragmaNodes[i - 1] = toNim(cn[i])
+          result = node(nnkPragmaBlock, topInfo, node(nnkPragma, topInfo, pragmaNodes), toNim(cn[^1]))
+      of "pragma-expr":
+        if cn.len > 1:
+          let expr = toNim(cn[1])
+          var pragmaNodes = newSeq[UntypedNode](cn.len - 2)
+          for i in 2 ..< cn.len:
+            pragmaNodes[i - 2] = toNim(cn[i])
+          result = node(nnkPragmaExpr, topInfo, expr, node(nnkPragma, topInfo, pragmaNodes))
+      of "of?":
+        if cn.len == 3:
+          result = node(nnkInfix, topInfo, node(nnkIdent, cn[0].info, "of"), toNim(cn[1]), toNim(cn[2]))
+      of "of":
+        # needed to be separate from of? for post expr blocks
+        result = node(nnkOfBranch, topInfo, map(args))
+      of "except":
+        result = node(nnkExceptBranch, topInfo, map(args))
+      of "elif":
+        if cn.len == 3:
+          result = node(nnkElifBranch, topInfo, map(args))
+      of "else":
+        if cn.len == 2:
+          result = node(nnkElse, topInfo, map(args))
+      of "finally":
+        if cn.len == 2:
+          result = node(nnkFinally, topInfo, map(args))
+      of "while":
+        if cn.len == 3:
+          result = node(nnkWhileStmt, topInfo, map(args))
+      of "if", "when":
+        if cn.len > 2:
+          let kind = if a == "if": nnkIfStmt else: nnkWhenStmt
+          var nodes = newSeq[UntypedNode](cn.len - 2)
+          nodes[0] = node(nnkElifBranch, cn[1].info, toNim(cn[1]), toNim(cn[2]))
+          for i in 3 ..< cn.len:
+            nodes[i - 2] = toNim(cn[i])
+          result = node(kind, topInfo, nodes)
+      of "try":
+        if cn.len > 2:
+          result = node(nnkTryStmt, topInfo, map(args))
+      of "case":
+        if cn.len > 2:
+          result = node(nnkCaseStmt, topInfo, map(args))
+      of "using":
+        var nodes = newSeq[UntypedNode](cn.len - 1)
+        for i in 1 ..< cn.len:
+          nodes[i - 1] = typeBiasedIdentDef(cn[i])
+        result = node(nnkUsingStmt, topInfo, nodes)
     if result.kind == nnkNone:
       var nodes = newSeq[UntypedNode](cn.len)
       for i in 0 ..< cn.len:
@@ -195,9 +443,6 @@ proc toNim*(lisp: Lisp): UntypedNode =
       result = node(nnkCall, topInfo, nodes)
 
 # node todo:
-  # nnkAsgn
-  # nnkVarSection, nnkLetSection, nnkConstSection
-  # nnkVarTuple
   # nnkPragmaExpr in definitions
   # nnkProcDef, nnkFuncDef, nnkMethodDef, nnkConverterDef, nnkMacroDef, nnkTemplateDef, nnkIteratorDef
   # nnkGenericParams
@@ -206,27 +451,6 @@ proc toNim*(lisp: Lisp): UntypedNode =
   # nnkPragma
   # nnkLambda
   # nnkDo
-  # nnkTypeSection
-  # nnkTypeDef
-  # nnkImportAs
-  # nnkUsingStmt
   # nnkTypeClassTy concept
   # nnkProcTy, nnkIteratorTy
-  # nnkObjectTy
-    # nnkOfInherit
-    # nnkRecList
-    # nnkRecCase
-    # nnkRecWhen
-  # nnkEnumTy
-    # nnkEnumFieldDef
-  # nnkPragmaBlock
-  # nnkPostfix
-  # nnkIfStmt, nnkWhenStmt, nnkWhileStmt, nnkCaseStmt, nnkTryStmt
-  # nnkOfBranch
-  # nnkElifBranch
-  # nnkElse
-  # nnkExceptBranch
-  # nnkFinally
   # nnkForStmt
-  # nnkCommand, nnkInfix, nnkPrefix ? nnkDotCall
-  # nnkStmtListType, nnkBlockType
