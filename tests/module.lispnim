@@ -1,0 +1,12 @@
+(let (a 1))
+(let (b (uint 2)))
+(let (c (int8 3)))
+(let (d 'a'))
+(let
+  (e 4.0)
+  (f "abc"))
+(proc (foo *) ((x y int) int) (do
+  (= result (* x (+ a y)))
+  (return result)))
+(let (g (foo 5 6)))
+(when (compiles (do (export foo))) (do (export foo)))

@@ -34,10 +34,13 @@ proc toNim*(lisp: Lisp): UntypedNode =
       result = node(nnkIntLit, topInfo, parseBiggestInt(n))
     else:
       var u = parseBiggestUInt(n)
-      if u > high(BiggestInt).BiggestUint:
-        result = node(nnkUIntLit, topInfo, u)
-      else:
+      when defined(js):
         result = node(nnkIntLit, topInfo, u.BiggestInt)
+      else:
+        if u > high(BiggestInt).BiggestUint:
+          result = node(nnkUIntLit, topInfo, u)
+        else:
+          result = node(nnkIntLit, topInfo, u.BiggestInt)
   of String:
     result = node(nnkStrLit, topInfo, lisp.str)
   of Character:
@@ -115,6 +118,74 @@ proc toNim*(lisp: Lisp): UntypedNode =
             result = node(nnkIdentDefs, n.info, defNodes)
         else:
           result = node(nnkIdentDefs, n.info, ident(n), node(nnkEmpty, n.info), node(nnkEmpty, n.info))
+      proc procParamList(n: Lisp): UntypedNode =
+        if n.kind == List and (let pc = n.children;
+            pc.len != 0):
+          var paramNodes = newSeq[UntypedNode](pc.len)
+          paramNodes[0] = toNim(pc[^1])
+          for i in 1 ..< pc.len:
+            paramNodes[i] = typeBiasedIdentDef(pc[i - 1])
+          node(nnkFormalParams, n.info, paramNodes)
+        else:
+          # just return type
+          node(nnkFormalParams, n.info, toNim(n))
+      proc doProc(kind: UntypedNodeKind, info: LineInfo, ns: openarray[Lisp]): UntypedNode =
+        if ns.len > 1:
+          var name = ident(ns[0])
+          var i = 1
+          var pattern = node(nnkEmpty, info)
+          if i + 1 < ns.len and ns[i].kind == List and (let pnc = ns[i].children;
+            pnc.len != 0 and pnc[0].kind == Atom and pnc[0].atom == "pattern"):
+            var patternNodes = newSeq[UntypedNode](pnc.len - 1)
+            for i in 1 ..< pnc.len:
+              patternNodes[i - 1] = typeBiasedIdentDef(pnc[i])
+            pattern = node(nnkPattern, ns[i].info, patternNodes)
+            inc i
+          var generics = node(nnkEmpty, info)
+          if i + 1 < ns.len and ns[i].kind == List and (let gc = ns[i].children;
+            gc.len != 0 and gc[0].kind == Atom and gc[0].atom == "generics"):
+            var genericParamNodes = newSeq[UntypedNode](gc.len - 1)
+            for i in 1 ..< gc.len:
+              genericParamNodes[i - 1] = typeBiasedIdentDef(gc[i])
+            generics = node(nnkGenericParams, ns[i].info, genericParamNodes)
+            inc i
+          let params = procParamList(ns[i])
+          inc i
+          var pragma = node(nnkEmpty, info)
+          if name.kind == nnkPragmaExpr:
+            pragma = name.children[1]
+            name = name.children[0]
+          elif i < ns.len and ns[i].kind == List and (let pgc = ns[i].children;
+            pgc.len != 0 and pgc[0].kind == Atom and pgc[0].atom == "pragma"):
+            var pragmaNodes = newSeq[UntypedNode](pgc.len - 1)
+            for i in 1 ..< pgc.len:
+              pragmaNodes[i - 1] = toNim(pgc[i])
+            pragma = node(nnkPragma, ns[i].info, pragmaNodes)
+            inc i
+          var body = node(nnkEmpty, info)
+          if i < ns.len: body = toNim(ns[i])
+          result = node(kind, info, name, pattern, generics, params, pragma, node(nnkEmpty, info), body)
+      proc procType(kind: UntypedNodeKind, info: LineInfo, ns: openarray[Lisp]): UntypedNode =
+        case ns.len
+        of 0: result = node(kind, topInfo)
+        of 1:
+          if ns[0].kind == List and (let pgc = ns[0].children;
+            pgc.len != 0 and pgc[0].kind == Atom and pgc[0].atom == "pragma"):
+            var pragmaNodes = newSeq[UntypedNode](pgc.len - 1)
+            for i in 1 ..< pgc.len:
+              pragmaNodes[i - 1] = toNim(pgc[i])
+            result = node(kind, topInfo, node(nnkEmpty, topInfo),
+              node(nnkPragma, ns[0].info, pragmaNodes))
+          else:
+            result = node(kind, topInfo, procParamList(ns[0]))
+        elif ns[1].kind == List and (let pgc = ns[1].children;
+          pgc.len != 0 and pgc[0].kind == Atom and pgc[0].atom == "pragma"):
+          let params = procParamList(ns[0])
+          var pragmaNodes = newSeq[UntypedNode](pgc.len - 1)
+          for i in 1 ..< pgc.len:
+            pragmaNodes[i - 1] = toNim(pgc[i])
+          result = node(kind, topInfo, params,
+            node(nnkPragma, ns[1].info, pragmaNodes))
       let a = cn[0].atom
       template args: untyped = cn.toOpenArray(1, cn.len - 1)
       case a
@@ -210,7 +281,7 @@ proc toNim*(lisp: Lisp): UntypedNode =
           result = node(nnkPtrTy, topInfo, map(args))
       of "out":
         if cn.len < 3:
-          result = node(nnkMutableTy, topInfo, map(args))
+          result = node(when compiles(nnkMutableTy): nnkMutableTy else: nnkOutTy, topInfo, map(args))
       of "distinct":
         if cn.len < 3:
           result = node(nnkDistinctTy, topInfo, map(args))
@@ -431,6 +502,24 @@ proc toNim*(lisp: Lisp): UntypedNode =
         for i in 1 ..< cn.len:
           nodes[i - 1] = typeBiasedIdentDef(cn[i])
         result = node(nnkUsingStmt, topInfo, nodes)
+      of "for":
+        if cn.len > 2:
+          var nodes = newSeq[UntypedNode](cn.len - 1)
+          for i in 1 ..< cn.len - 2:
+            nodes[i - 1] = ident(cn[i], true)
+          nodes[cn.len - 2] = toNim(cn[cn.len - 2])
+          nodes[cn.len - 1] = toNim(cn[cn.len - 1])
+          result = node(nnkForStmt, topInfo, nodes)
+      of "proc": result = doProc(nnkProcDef, topInfo, args)
+      of "func": result = doProc(nnkFuncDef, topInfo, args)
+      of "method": result = doProc(nnkMethodDef, topInfo, args)
+      of "converter": result = doProc(nnkConverterDef, topInfo, args)
+      of "macro": result = doProc(nnkMacroDef, topInfo, args)
+      of "template": result = doProc(nnkTemplateDef, topInfo, args)
+      of "iterator": result = doProc(nnkIteratorDef, topInfo, args)
+      of "proc-type": result = procType(nnkProcTy, topInfo, args)
+      of "iterator-type": result = procType(nnkIteratorTy, topInfo, args)
+      of "pragma": result = node(nnkPragma, topInfo, map(args))
     if result.kind == nnkNone:
       var nodes = newSeq[UntypedNode](cn.len)
       for i in 0 ..< cn.len:
@@ -442,15 +531,10 @@ proc toNim*(lisp: Lisp): UntypedNode =
           nodes[i] = toNim(n)
       result = node(nnkCall, topInfo, nodes)
 
-# node todo:
-  # nnkPragmaExpr in definitions
-  # nnkProcDef, nnkFuncDef, nnkMethodDef, nnkConverterDef, nnkMacroDef, nnkTemplateDef, nnkIteratorDef
-  # nnkGenericParams
-  # nnkFormalParams
-  # nnkPattern
-  # nnkPragma
-  # nnkLambda
+proc toNim*(lisps: openarray[Lisp]): seq[UntypedNode] =
+  result = newSeq[UntypedNode](lisps.len)
+  for i in 0 ..< lisps.len: result[i] = toNim(lisps[i])
+
+# nodes left:
   # nnkDo
   # nnkTypeClassTy concept
-  # nnkProcTy, nnkIteratorTy
-  # nnkForStmt

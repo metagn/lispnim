@@ -15,7 +15,7 @@ proc advance*(str: string, p: var ParseState) =
   else:
     inc p.pos
     if (p.pos < str.len and str[p.pos] == '\n') or
-      (p.pos + 1 < str.len and str[p.pos] == '\r' and str[p.pos + 1] == '\n'):
+      (p.pos + 1 < str.len and str[p.pos] == '\r' and str[p.pos + 1] == '\n' and (inc p.pos; true)):
       inc p.ln
       p.cl = 0
     else:
@@ -102,7 +102,7 @@ proc parseLisp*(str: string, p: var ParseState): seq[Lisp] =
     let c = str[p.pos]
     case c
     of Whitespace: discard
-    else: result.add(parseLisp(str, p))
+    else: result.add(parseSingleLisp(str, p))
     advance(str, p)
 
 proc init*(str: string, p: var ParseState) =
